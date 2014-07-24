@@ -11,23 +11,43 @@ depend()
 	keyword -prefix -vserver -lxc
 }
 
+umount_olddev()
+{
+	local mtp
+	if mountinfo -q /dev; then
+		mountinfo | \
+		awk '/^\/run\/olddev(\/.*)?$/ { mtp[++n]=$0 } END{ for(;n>0;n--) print mtp[n] }' | \
+		while IFS= read mtp; do
+			umount "$mtp"  >/dev/null 2>&1
+		done
+	fi
+}
+
 mount_dev()
 {
-	local action=--mount devfstype msg=Mounting
+	local devfstype
 	# Some devices require exec, Bug #92921
 	local mountopts="exec,nosuid,mode=0755"
 	if yesno ${static_dev:-no}; then
 		einfo "Using static /dev"
 		return 0
 	fi
-	if mountinfo -q /dev; then
-		action=--remount
-		mountopts="remount,$mountopts"
-		msg=Remounting
-	fi
 	if fstabinfo -q /dev; then
+		if mountinfo -q /dev; then
+			ebegin "Moving existing /dev to /run/olddev"
+			mkdir -p /run/olddev
+			chmod 700 /run/olddev
+			mount -n --move /dev /run/olddev
+			eend $?
+		fi
 		ebegin "$msg /dev according to @SYSCONFDIR@/fstab"
-		fstabinfo -q $action /dev
+		fstabinfo --mount /dev
+		eend $?
+		return 0
+	fi
+	if mountinfo -q /dev; then
+		ebegin "Remounting /dev to force required options"
+		mount -n -o remount,$mountopts dev /dev
 		eend $?
 		return 0
 	fi
@@ -39,7 +59,7 @@ mount_dev()
 		mountopts="$mountopts,size=10M"
 	fi
 	if [ -n "$devfstype" ]; then
-		ebegin "$msg $devfstype on /dev"
+		ebegin "Mounting $devfstype on /dev"
 		mount -n -t $devfstype -o $mountopts dev /dev
 		eend $?
 	else
@@ -50,22 +70,34 @@ mount_dev()
 	fi
 }
 
+mknod_c()
+{
+	# make sure we get the nodes we want (replacing plain files where necessary)
+	local name
+	name=$1  # always pass device path as first argument
+	shift
+	if ! [ -c $name ]; then
+		rm -f $name
+		mknod $name c "$@"
+	fi
+}
+
 seed_dev()
 {
 	# Seed /dev with some things that we know we need
 
 	# creating /dev/console, /dev/tty and /dev/tty1 to be able to write
 	# to $CONSOLE with/without bootsplash before udevd creates it
-	[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
-	[ -c /dev/tty1 ] || mknod -m 620 /dev/tty1 c 4 1
-	[ -c /dev/tty ] || mknod -m 666 /dev/tty c 5 0
+	mknod_c /dev/console 5 1 -m 600
+	mknod_c /dev/tty1 4 1 -m 620
+	mknod_c /dev/tty 5 0 -m 666
 
 	# udevd will dup its stdin/stdout/stderr to /dev/null
 	# and we do not want a file which gets buffered in ram
-	[ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
+	mknod_c /dev/null 1 3 -m 666
 
 	# so udev can add its start-message to dmesg
-	[ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
+	mknod_c /dev/kmsg 1 11 -m 660
 
 	# Mount required stuff as user may not have then in /etc/fstab
 	for x in \
@@ -75,7 +107,7 @@ seed_dev()
 	; do
 		set -- $x
 		grep -Eq "[[:space:]]+$1$" /proc/filesystems || continue
-		mountinfo -q $2 && continue
+		mountinfo $2 && continue
 
 		if [ ! -d $2 ]; then
 			mkdir -m $3 -p $2 >/dev/null 2>&1 || \
@@ -108,5 +140,6 @@ start()
 	mount_dev
 	seed_dev
 	restorecon_dev
+	umount_olddev
 	return 0
 }
